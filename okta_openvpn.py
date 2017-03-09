@@ -17,6 +17,7 @@ import os
 import platform
 import stat
 import sys
+import time
 import urlparse
 
 from cryptography import x509
@@ -27,7 +28,7 @@ import urllib3
 
 from okta_pinset import okta_pinset
 
-version = "0.10.0"
+version = "0.10.1-beta"
 # OktaOpenVPN/0.10.0 (Darwin 12.4.0) CPython/2.7.5
 user_agent = ("OktaOpenVPN/{version} "
               "({system} {system_version}) "
@@ -97,6 +98,8 @@ class PublicKeyPinsetConnectionPool(urllib3.HTTPSConnectionPool):
 class OktaAPIAuth(object):
     def __init__(self, okta_url, okta_token,
                  username, password, client_ipaddr,
+                 mfa_push_delay_secs=None,
+                 mfa_push_max_retries=None,
                  assert_pinset=None):
         passcode_len = 6
         self.okta_url = None
@@ -106,6 +109,8 @@ class OktaAPIAuth(object):
         self.client_ipaddr = client_ipaddr
         self.passcode = None
         self.okta_urlparse = urlparse.urlparse(okta_url)
+        self.mfa_push_delay_secs = mfa_push_delay_secs
+        self.mfa_push_max_retries = mfa_push_max_retries
         if assert_pinset is None:
             assert_pinset = okta_pinset
         url_new = (self.okta_urlparse.scheme,
@@ -172,7 +177,9 @@ class OktaAPIAuth(object):
             password == '')
         if invalid_username_or_password:
             log.info("Missing username or password for user: %s (%s) - "
-                     "Reported username may be 'None' due to this", username, self.client_ipaddr)
+                     "Reported username may be 'None' due to this",
+                     username,
+                     self.client_ipaddr)
             return False
 
         if not self.passcode:
@@ -186,11 +193,13 @@ class OktaAPIAuth(object):
             return False
         if 'errorCauses' in rv:
             msg = rv['errorSummary']
-            log.info('User %s pre-authentication failed: %s', self.username, msg)
+            log.info('User %s pre-authentication failed: %s',
+                     self.username,
+                     msg)
             return False
         elif 'status' in rv:
             status = rv['status']
-
+        
         if status == "SUCCESS":
             log.info('User %s authenticated without MFA', self.username)
             return True
@@ -200,29 +209,44 @@ class OktaAPIAuth(object):
         elif status == "MFA_REQUIRED" or status == "MFA_CHALLENGE":
             log.debug("User %s password validates, checking second factor",
                       self.username)
-
             res = None
             for factor in rv['_embedded']['factors']:
-                if factor['factorType'] != "token:software:totp":
+                supported_factor_types = ["token:software:totp", "push"]
+                if factor['factorType'] not in supported_factor_types:
                     continue
                 fid = factor['id']
                 state_token = rv['stateToken']
+                waiting_on_push = False
                 try:
                     res = self.doauth(fid, state_token)
-                except Exception, s:
-                    log.error('Unexpected error with the Okta API: %s', s)
+                    check_count = 0
+                    while 'factorResult' in res and res['factorResult'] == 'WAITING':
+                        print("Sleeping for {}".format(self.mfa_push_delay_secs))
+                        time.sleep(self.mfa_push_delay_secs)
+                        res = self.doauth(fid, state_token)
+                        check_count += 1
+                        if check_count > self.mfa_push_max_retries:
+                            log.info('User %s MFA push timed out' %
+                                     self.username)
+                            return False
+                except Exception, e:
+                    log.error('Unexpected error with the Okta API: %s', e)
                     return False
                 if 'status' in res and res['status'] == 'SUCCESS':
                     log.info("User %s is now authenticated "
                              "with MFA via Okta API", self.username)
                     return True
-
+        
             if 'errorCauses' in res:
                 msg = res['errorCauses'][0]['errorSummary']
-                log.debug('User %s MFA token authentication failed: %s', self.username, msg)
+                log.debug('User %s MFA token authentication failed: %s',
+                          self.username,
+                          msg)
             return False
         else:
-            log.info("User %s is not allowed to authenticate: %s", self.username, status)
+            log.info("User %s is not allowed to authenticate: %s",
+                     self.username,
+                     status)
             return False
 
 
@@ -238,6 +262,9 @@ class OktaOpenVPNValidator(object):
         self.okta_config = {}
         self.username_suffix = None
         self.always_trust_username = False
+        # Try for up to 2 minutes by default
+        self.mfa_push_max_retries = "20"
+        self.mfa_push_delay_secs = "3"
 
     def read_configuration_file(self):
         cfg_path_defaults = [
@@ -248,6 +275,8 @@ class OktaOpenVPNValidator(object):
         parser_defaults = {
             'AllowUntrustedUsers': self.always_trust_username,
             'UsernameSuffix': self.username_suffix,
+            'MFAPushMaxRetries': self.mfa_push_max_retries,
+            'MFAPushDelaySeconds': self.mfa_push_delay_secs,
             }
         if self.config_file:
             cfg_path = []
@@ -261,6 +290,10 @@ class OktaOpenVPNValidator(object):
                     self.site_config = {
                         'okta_url': cfg.get('OktaAPI', 'Url'),
                         'okta_token': cfg.get('OktaAPI', 'Token'),
+                        'mfa_push_max_retries': cfg.get('OktaAPI',
+                                                        'MFAPushMaxRetries'),
+                        'mfa_push_delay_secs': cfg.get('OktaAPI',
+                                                       'MFAPushDelaySeconds'),
                         }
                     always_trust_username = cfg.get(
                         'OktaAPI',
@@ -313,6 +346,9 @@ class OktaOpenVPNValidator(object):
             'password': password,
             'client_ipaddr': client_ipaddr,
         }
+        for item in ['mfa_push_max_retries', 'mfa_push_delay_secs']:
+            if item in self.site_config:
+                self.okta_config[item] = self.site_config[item]
         assert_pin = self.env.get('assert_pin')
         if assert_pin:
             self.okta_config['assert_pinset'] = [assert_pin]
@@ -371,6 +407,7 @@ class OktaOpenVPNValidator(object):
                 f.write('0')
         except:
             pass
+    
 
     def run(self):
         self.read_configuration_file()
