@@ -22,3 +22,5 @@ Token:
 ## Values below are what are set by default:
 # MFAPushMaxRetries: 20
 # MFAPushDelaySeconds: 3
+## Configure what groups are allowed to connect to server
+# AllowedGroups: vpnusers, developers
