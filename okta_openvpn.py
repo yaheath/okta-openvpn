@@ -333,11 +333,11 @@ class OktaOpenVPNValidator(object):
                                                        'MFAPushDelaySeconds'),
                         }
                     trusted_groups = cfg.get('OktaAPI', 'AllowedGroups')
+                    tmp_groups = []
                     if trusted_groups:
-                        allowed_groups = trusted_groups.split(',')
-                        self.site_config['allowed_groups'] = allowed_groups
-                    else:
-                        self.site_config['allowed_groups'] = None
+                        for group in trusted_groups.split(','):
+                            tmp_groups.append(group.strip())
+                    self.site_config['allowed_groups'] = tmp_groups
                     always_trust_username = cfg.get(
                         'OktaAPI',
                         'AllowUntrustedUsers')
