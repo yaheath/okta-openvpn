@@ -137,6 +137,7 @@ class OktaAPIAuth(object):
             'content-type': 'application/json',
             'accept': 'application/json',
             'authorization': ssws,
+            'x-forwarded-for': self.client_ipaddr,
             }
         url = "{base}/api/v1{path}".format(base=self.okta_url, path=path)
         if data:
